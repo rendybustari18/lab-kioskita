@@ -1,0 +1,12 @@
+{
+ "KK-06": {
+  "dieksekusi": true,
+  "panjang_token_terbaca": 343,
+  "teks_tampil": "Barang aman, siap kirim"
+ },
+ "KK-07": {
+  "dieksekusi": true,
+  "panjang_token_terbaca": 343,
+  "teks_tampil": "Hasil pencarian pesanan untuk kata kunci:"
+ }
+}

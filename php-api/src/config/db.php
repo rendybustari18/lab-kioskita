@@ -16,11 +16,13 @@ try {
         PDO::ATTR_EMULATE_PREPARES => false,
     ]);
 } catch (PDOException $e) {
+    // KK-16: pesan PDO memuat host, user, dan nama DB — hanya ke log server.
+    error_log('[db] koneksi gagal: ' . $e->getMessage());
     http_response_code(500);
     header('Content-Type: application/json');
     echo json_encode([
         'status' => 'error',
-        'message' => 'Database connection failed: ' . $e->getMessage()
+        'message' => 'Layanan sedang tidak tersedia'
     ]);
     exit;
 }

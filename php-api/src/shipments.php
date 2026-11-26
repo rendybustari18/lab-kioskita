@@ -2,6 +2,7 @@
 // KiosKita - Legacy Shipping & Invoice Document Handler
 require_once __DIR__ . '/config/db.php';
 require_once __DIR__ . '/helpers/response.php';
+require_once __DIR__ . '/helpers/auth.php';
 
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Headers: Content-Type, Authorization, X-User-Id, X-User-Role, X-Tenant-Id');
@@ -13,21 +14,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 $action = $_GET['action'] ?? 'list';
-$currentUserId = $_SERVER['HTTP_X_USER_ID'] ?? null;
-$currentUserRole = $_SERVER['HTTP_X_USER_ROLE'] ?? 'customer';
-$currentTenantId = $_SERVER['HTTP_X_TENANT_ID'] ?? null;
+// KK-15: identitas wajib ada & sah (fail closed).
+$user = currentUser();
 
 switch ($action) {
     case 'list':
-        handleListShipments($pdo, $currentUserId, $currentUserRole, $currentTenantId);
+        handleListShipments($pdo, $user);
         break;
 
     case 'invoice':
-        handleGetInvoice($pdo);
+        handleGetInvoice($pdo, $user);
         break;
 
     case 'create':
-        handleCreateShipment($pdo);
+        handleCreateShipment($pdo, $user);
         break;
 
     default:
@@ -35,7 +35,7 @@ switch ($action) {
 }
 
 // 1. Daftar resi dan dokumen pengiriman
-function handleListShipments($pdo, $userId, $role, $tenantId) {
+function handleListShipments($pdo, array $user) {
     $query = "SELECT s.*, o.order_number, o.status as order_status, u.name as customer_name, t.name as tenant_name
               FROM shipments s
               JOIN orders o ON s.order_id = o.id
@@ -44,12 +44,12 @@ function handleListShipments($pdo, $userId, $role, $tenantId) {
               WHERE 1=1";
     $params = [];
 
-    if ($role === 'customer') {
+    if ($user['role'] === 'customer') {
         $query .= " AND o.customer_id = ?";
-        $params[] = $userId;
-    } elseif ($role !== 'admin' && !empty($tenantId)) {
+        $params[] = $user['id'];
+    } elseif ($user['role'] !== 'admin') {
         $query .= " AND o.tenant_id = ?";
-        $params[] = $tenantId;
+        $params[] = $user['tenant_id'];
     }
 
     $query .= " ORDER BY s.id DESC";
@@ -64,13 +64,14 @@ function handleListShipments($pdo, $userId, $role, $tenantId) {
     ]);
 }
 
-// 2. Akses Dokumen Invoice (IDOR Vulnerability)
-// Celah IDOR: Invoice dapat diakses oleh user siapa saja hanya dengan mengganti order_id
-function handleGetInvoice($pdo) {
+// 2. Akses Dokumen Invoice
+// KK-04: faktur memuat nama, email, telepon, dan alamat — hanya untuk pihak yang berhak atas pesanannya.
+function handleGetInvoice($pdo, array $user) {
     $orderId = $_GET['order_id'] ?? $_GET['id'] ?? null;
     if (!$orderId) {
         sendError('Parameter order_id wajib diisi', 400);
     }
+    $milik = loadOrderForUser($pdo, $orderId, $user);
 
     $stmt = $pdo->prepare("SELECT o.*, u.name as customer_name, u.email as customer_email, u.phone as customer_phone,
                                   a.recipient_name, a.phone as shipping_phone, a.address_line, a.city, a.postal_code,
@@ -82,18 +83,14 @@ function handleGetInvoice($pdo) {
                            LEFT JOIN addresses a ON o.shipping_address_id = a.id
                            LEFT JOIN shipments s ON s.order_id = o.id
                            WHERE o.id = ?");
-    $stmt->execute([$orderId]);
+    $stmt->execute([$milik['id']]);
     $invoice = $stmt->fetch();
-
-    if (!$invoice) {
-        sendError('Invoice tidak ditemukan', 404);
-    }
 
     $itemStmt = $pdo->prepare("SELECT oi.*, p.name as product_name, p.sku
                                FROM order_items oi
                                JOIN products p ON oi.product_id = p.id
                                WHERE oi.order_id = ?");
-    $itemStmt->execute([$orderId]);
+    $itemStmt->execute([$milik['id']]);
     $invoice['items'] = $itemStmt->fetchAll();
 
     sendJson([
@@ -103,28 +100,57 @@ function handleGetInvoice($pdo) {
 }
 
 // 3. Buat entri pengiriman baru
-function handleCreateShipment($pdo) {
-    $input = json_decode(file_get_contents('php://input'), true);
+// KK-10: hanya staf/manager/admin, hanya untuk pesanan tenant-nya, dan hanya dari status yang belum dikirim.
+function handleCreateShipment($pdo, array $user) {
+    requireRole($user, PERAN_STAF);
+
+    $input = readJsonBody();
     $orderId = $input['order_id'] ?? null;
-    $courier = $input['courier'] ?? 'JNE Reguler';
+    $courier = preg_replace('/\s+/u', ' ', trim((string) ($input['courier'] ?? 'JNE Reguler')));
     $labelFormat = $input['label_format'] ?? 'standard';
-    $trackingNumber = 'TRK-' . date('Ymd') . '-' . strtoupper(substr(bin2hex(random_bytes(4)), 0, 6));
 
     if (!$orderId) {
         sendError('Parameter order_id wajib diisi', 400);
     }
+    if (!kurirValid($courier)) {
+        sendError('Nama kurir tidak valid', 400);
+    }
+    if (!in_array($labelFormat, FORMAT_LABEL, true)) {
+        sendError('Format label tidak dikenal', 400);
+    }
 
-    $stmt = $pdo->prepare("INSERT INTO shipments (order_id, tracking_number, courier, delivery_status, label_format, shipping_date)
-                           VALUES (?, ?, ?, 'manifested', ?, NOW())");
-    $stmt->execute([$orderId, $trackingNumber, $courier, $labelFormat]);
+    $trackingNumber = 'TRK-' . date('Ymd') . '-' . strtoupper(substr(bin2hex(random_bytes(4)), 0, 6));
 
-    $updateOrder = $pdo->prepare("UPDATE orders SET status = 'shipped' WHERE id = ?");
-    $updateOrder->execute([$orderId]);
+    try {
+        $pdo->beginTransaction();
+
+        $order = loadOrderForUser($pdo, $orderId, $user, true);
+        if (!in_array($order['status'], ['pending', 'confirmed', 'processing'], true)) {
+            $pdo->rollBack();
+            sendError("Pesanan berstatus '{$order['status']}' tidak dapat dikirim", 409);
+        }
+
+        $stmt = $pdo->prepare("INSERT INTO shipments (order_id, tracking_number, courier, delivery_status, label_format, shipping_date)
+                               VALUES (?, ?, ?, 'manifested', ?, NOW())");
+        $stmt->execute([$order['id'], $trackingNumber, $courier, $labelFormat]);
+        $shipmentId = $pdo->lastInsertId();
+
+        $updateOrder = $pdo->prepare("UPDATE orders SET status = 'shipped' WHERE id = ?");
+        $updateOrder->execute([$order['id']]);
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        error_log('[shipments] create gagal: ' . $e->getMessage());
+        sendError('Resi gagal dibuat', 500);
+    }
 
     sendJson([
         'success' => true,
         'message' => 'Resi pengiriman berhasil dibuat',
         'tracking_number' => $trackingNumber,
-        'shipment_id' => $pdo->lastInsertId()
+        'shipment_id' => $shipmentId
     ]);
 }

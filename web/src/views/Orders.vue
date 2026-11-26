@@ -35,9 +35,9 @@
       </div>
     </div>
 
-    <!-- Sink DOM/Rendering XSS: Query pencarian dirender langsung via v-html -->
+    <!-- KK-07: kata kunci adalah input pengguna -> markup tetap di template, nilai lewat {{ }} (di-escape). -->
     <div v-if="searchQuery" class="alert alert-info">
-      <span v-html="'Hasil pencarian pesanan untuk kata kunci: <b>' + searchQuery + '</b>'"></span>
+      <span>Hasil pencarian pesanan untuk kata kunci: <b>{{ searchQuery }}</b></span>
     </div>
 
     <!-- Tabel Pesanan -->

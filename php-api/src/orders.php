@@ -2,6 +2,7 @@
 // KiosKita - Legacy Order Management Handler
 require_once __DIR__ . '/config/db.php';
 require_once __DIR__ . '/helpers/response.php';
+require_once __DIR__ . '/helpers/auth.php';
 
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Headers: Content-Type, Authorization, X-User-Id, X-User-Role, X-Tenant-Id');
@@ -13,30 +14,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 $action = $_GET['action'] ?? 'list';
-$currentUserId = $_SERVER['HTTP_X_USER_ID'] ?? null;
-$currentUserRole = $_SERVER['HTTP_X_USER_ROLE'] ?? 'customer';
-$currentTenantId = $_SERVER['HTTP_X_TENANT_ID'] ?? null;
+// KK-15: identitas wajib ada & sah untuk SEMUA aksi (fail closed).
+$user = currentUser();
 
 // Routing alur pesanan legacy
 switch ($action) {
     case 'list':
-        handleListOrders($pdo, $currentUserId, $currentUserRole, $currentTenantId);
+        handleListOrders($pdo, $user);
         break;
 
     case 'detail':
-        handleOrderDetail($pdo);
+        handleOrderDetail($pdo, $user);
         break;
 
     case 'add_note':
-        handleAddNote($pdo, $currentUserId);
+        handleAddNote($pdo, $user);
         break;
 
     case 'get_notes':
-        handleGetNotes($pdo);
+        handleGetNotes($pdo, $user);
         break;
 
     case 'cancel':
-        handleCancelOrder($pdo);
+        handleCancelOrder($pdo, $user);
         break;
 
     default:
@@ -44,24 +44,24 @@ switch ($action) {
 }
 
 // 1. Daftar pesanan
-function handleListOrders($pdo, $userId, $role, $tenantId) {
+function handleListOrders($pdo, array $user) {
     $search = $_GET['search'] ?? '';
     $status = $_GET['status'] ?? '';
 
-    $query = "SELECT o.*, u.name as customer_name, u.email as customer_email, t.name as tenant_name 
+    $query = "SELECT o.*, u.name as customer_name, u.email as customer_email, t.name as tenant_name
               FROM orders o
               JOIN users u ON o.customer_id = u.id
               JOIN tenants t ON o.tenant_id = t.id
               WHERE 1=1";
     $params = [];
 
-    // Filter role
-    if ($role === 'customer') {
+    // Filter role (cakupan sama dengan canAccessOrder)
+    if ($user['role'] === 'customer') {
         $query .= " AND o.customer_id = ?";
-        $params[] = $userId;
-    } elseif ($role !== 'admin' && !empty($tenantId)) {
+        $params[] = $user['id'];
+    } elseif ($user['role'] !== 'admin') {
         $query .= " AND o.tenant_id = ?";
-        $params[] = $tenantId;
+        $params[] = $user['tenant_id'];
     }
 
     if (!empty($search)) {
@@ -87,13 +87,14 @@ function handleListOrders($pdo, $userId, $role, $tenantId) {
     ]);
 }
 
-// 2. Detail pesanan (IDOR Vulnerability)
-// Celah IDOR: Detail pesanan dibuka langsung berdasarkan order_id tanpa verifikasi customer_id / tenant_id
-function handleOrderDetail($pdo) {
+// 2. Detail pesanan
+// KK-03: kepemilikan diperiksa di server SEBELUM data dikembalikan (bukan disembunyikan di UI).
+function handleOrderDetail($pdo, array $user) {
     $orderId = $_GET['id'] ?? $_GET['order_id'] ?? null;
     if (!$orderId) {
         sendError('Parameter id pesanan diperlukan', 400);
     }
+    $milik = loadOrderForUser($pdo, $orderId, $user);
 
     $stmt = $pdo->prepare("SELECT o.*, u.name as customer_name, u.email as customer_email, u.phone as customer_phone,
                                   a.recipient_name, a.phone as shipping_phone, a.address_line, a.city, a.postal_code,
@@ -103,19 +104,15 @@ function handleOrderDetail($pdo) {
                            JOIN tenants t ON o.tenant_id = t.id
                            LEFT JOIN addresses a ON o.shipping_address_id = a.id
                            WHERE o.id = ?");
-    $stmt->execute([$orderId]);
+    $stmt->execute([$milik['id']]);
     $order = $stmt->fetch();
-
-    if (!$order) {
-        sendError('Pesanan tidak ditemukan', 404);
-    }
 
     // Ambil item produk dalam pesanan
     $itemStmt = $pdo->prepare("SELECT oi.*, p.name as product_name, p.sku, p.category
                                FROM order_items oi
                                JOIN products p ON oi.product_id = p.id
                                WHERE oi.order_id = ?");
-    $itemStmt->execute([$orderId]);
+    $itemStmt->execute([$milik['id']]);
     $order['items'] = $itemStmt->fetchAll();
 
     sendJson([
@@ -124,22 +121,33 @@ function handleOrderDetail($pdo) {
     ]);
 }
 
-// 3. Tambah catatan pesanan (Stored XSS)
-// Catatan disimpan tanpa sanitasi HTML; dirender dengan v-html di web
-function handleAddNote($pdo, $userId) {
-    $input = json_decode(file_get_contents('php://input'), true) ?: $_POST;
+// 3. Tambah catatan pesanan
+// KK-05: hanya pihak yang berhak atas pesanan; penulis = pemanggil (bukan default admin #1);
+//        pelanggan hanya dapat menulis catatan bertipe 'customer'.
+// KK-06: konten disimpan apa adanya — pengamanan XSS dilakukan saat RENDER (encode on output).
+function handleAddNote($pdo, array $user) {
+    $input = readJsonBody();
     $orderId = $input['order_id'] ?? $_GET['order_id'] ?? null;
-    $content = $input['content'] ?? '';
+    $content = trim((string) ($input['content'] ?? ''));
     $noteType = $input['note_type'] ?? 'internal';
 
-    if (!$orderId || empty($content)) {
+    if (!$orderId || $content === '') {
         sendError('Order ID dan isi catatan wajib diisi', 400);
     }
+    if (mb_strlen($content) > 2000) {
+        sendError('Isi catatan maksimal 2000 karakter', 400);
+    }
+    if (!in_array($noteType, ['internal', 'customer'], true)) {
+        sendError('Tipe catatan tidak valid', 400);
+    }
+    if (!isStaf($user)) {
+        $noteType = 'customer';
+    }
 
-    $authorId = $userId ?: 1;
+    $order = loadOrderForUser($pdo, $orderId, $user);
 
     $stmt = $pdo->prepare("INSERT INTO order_notes (order_id, author_id, note_type, content) VALUES (?, ?, ?, ?)");
-    $stmt->execute([$orderId, $authorId, $noteType, $content]);
+    $stmt->execute([$order['id'], $user['id'], $noteType, $content]);
 
     sendJson([
         'success' => true,
@@ -149,18 +157,25 @@ function handleAddNote($pdo, $userId) {
 }
 
 // 4. Daftar catatan pesanan
-function handleGetNotes($pdo) {
+// KK-05: catatan 'internal' (instruksi gudang) hanya untuk staf; pelanggan melihat catatan 'customer'.
+function handleGetNotes($pdo, array $user) {
     $orderId = $_GET['order_id'] ?? $_GET['id'] ?? null;
     if (!$orderId) {
         sendError('Parameter order_id wajib diisi', 400);
     }
+    $order = loadOrderForUser($pdo, $orderId, $user);
 
-    $stmt = $pdo->prepare("SELECT n.*, u.name as author_name, u.role as author_role
-                           FROM order_notes n
-                           JOIN users u ON n.author_id = u.id
-                           WHERE n.order_id = ?
-                           ORDER BY n.id ASC");
-    $stmt->execute([$orderId]);
+    $sql = "SELECT n.*, u.name as author_name, u.role as author_role
+            FROM order_notes n
+            JOIN users u ON n.author_id = u.id
+            WHERE n.order_id = ?";
+    if (!isStaf($user)) {
+        $sql .= " AND n.note_type = 'customer'";
+    }
+    $sql .= " ORDER BY n.id ASC";
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([$order['id']]);
     $notes = $stmt->fetchAll();
 
     sendJson([
@@ -169,42 +184,57 @@ function handleGetNotes($pdo) {
     ]);
 }
 
-// 5. Pembatalan pesanan (Business Logic Flaw)
-// Celah: Tidak memeriksa status pesanan saat ini (misalnya status sudah 'shipped' atau 'delivered'),
-// dan langsung mengembalikan stok produk ke gudang tanpa validasi siklus hidup pesanan.
-function handleCancelOrder($pdo) {
-    $input = json_decode(file_get_contents('php://input'), true) ?: $_POST;
+// 5. Pembatalan pesanan
+// KK-09: (a) hanya pihak yang berhak, (b) hanya dari status yang masih boleh dibatalkan,
+//        (c) dalam satu transaksi dengan kunci baris — stok dikembalikan TEPAT SEKALI.
+function handleCancelOrder($pdo, array $user) {
+    $input = readJsonBody();
     $orderId = $input['order_id'] ?? $_GET['order_id'] ?? null;
 
     if (!$orderId) {
         sendError('Parameter order_id wajib disertakan', 400);
     }
 
-    $stmt = $pdo->prepare("SELECT id, status FROM orders WHERE id = ?");
-    $stmt->execute([$orderId]);
-    $order = $stmt->fetch();
+    // Pelanggan: sebelum diproses gudang. Staf: sampai sebelum dikirim.
+    $bolehBatal = isStaf($user) ? ['pending', 'confirmed', 'processing'] : ['pending', 'confirmed'];
 
-    if (!$order) {
-        sendError('Pesanan tidak ditemukan', 404);
-    }
+    try {
+        $pdo->beginTransaction();
 
-    // Bug: pembatalan dilakukan tanpa validasi status awal dan mengembalikan stok secara membabi buta
-    $updateStmt = $pdo->prepare("UPDATE orders SET status = 'cancelled' WHERE id = ?");
-    $updateStmt->execute([$orderId]);
+        $order = loadOrderForUser($pdo, $orderId, $user, true);
 
-    // Mengembalikan stok produk
-    $itemsStmt = $pdo->prepare("SELECT product_id, quantity FROM order_items WHERE order_id = ?");
-    $itemsStmt->execute([$orderId]);
-    $items = $itemsStmt->fetchAll();
+        if (!in_array($order['status'], $bolehBatal, true)) {
+            $pdo->rollBack();
+            sendError("Pesanan berstatus '{$order['status']}' tidak dapat dibatalkan", 409);
+        }
 
-    foreach ($items as $item) {
+        // Transisi bersyarat: bila status berubah di antara baca & tulis, tidak ada yang diubah.
+        $updateStmt = $pdo->prepare("UPDATE orders SET status = 'cancelled' WHERE id = ? AND status = ?");
+        $updateStmt->execute([$order['id'], $order['status']]);
+        if ($updateStmt->rowCount() !== 1) {
+            $pdo->rollBack();
+            sendError('Status pesanan berubah, silakan muat ulang', 409);
+        }
+
+        $itemsStmt = $pdo->prepare("SELECT product_id, quantity FROM order_items WHERE order_id = ?");
+        $itemsStmt->execute([$order['id']]);
         $stockStmt = $pdo->prepare("UPDATE products SET stock = stock + ? WHERE id = ?");
-        $stockStmt->execute([$item['quantity'], $item['product_id']]);
+        foreach ($itemsStmt->fetchAll() as $item) {
+            $stockStmt->execute([$item['quantity'], $item['product_id']]);
+        }
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        error_log('[orders] cancel gagal: ' . $e->getMessage());
+        sendError('Pembatalan gagal diproses', 500);
     }
 
     sendJson([
         'success' => true,
-        'message' => "Pesanan #{$orderId} berhasil dibatalkan dan stok dikembalikan",
+        'message' => "Pesanan #{$order['id']} berhasil dibatalkan dan stok dikembalikan",
         'previous_status' => $order['status'],
         'new_status' => 'cancelled'
     ]);

@@ -39,18 +39,11 @@
             <input :value="profileForm.tenant_name" disabled />
           </div>
 
-          <!-- Jalur Eksploitasi Privilege Escalation: field role dikirim dalam payload update profil -->
-          <div class="lab-warning-box">
-            <label class="lab-warning-title">Role Akun (Hak Akses):</label>
-            <select v-model="profileForm.role">
-              <option value="customer">customer (Pelanggan)</option>
-              <option value="staff">staff (Staf Operasional / Gudang)</option>
-              <option value="manager">manager (Manager Distribusi)</option>
-              <option value="admin">admin (Administrator Pusat)</option>
-            </select>
-            <div class="form-hint">
-              ⚠️ Endpoint backend mempercayai field role ini secara langsung (Privilege Escalation flaw).
-            </div>
+          <!-- KK-01: peran hanya ditampilkan; perubahan peran bukan wewenang pemilik akun
+               (server pun kini mengabaikan field role pada PUT /api/profile). -->
+          <div class="form-group">
+            <label class="form-label">Role Akun (Hak Akses):</label>
+            <input :value="profileForm.role" disabled />
           </div>
 
           <button type="submit" class="btn btn-primary" :disabled="savingProfile">

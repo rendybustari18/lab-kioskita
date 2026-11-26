@@ -39,14 +39,14 @@ const server = Bun.serve({
         response = Response.json({ success: true, message: 'Logout berhasil' });
       }
 
-      // 2. Profile routes (Privilege Escalation)
+      // 2. Profile routes (KK-01: role tidak dapat diubah lewat profil)
       else if (path === '/api/profile' && method === 'GET') {
         response = await handleGetProfile(req);
       } else if (path === '/api/profile' && method === 'PUT') {
         response = await handleUpdateProfile(req);
       }
 
-      // 3. Address routes (BOLA)
+      // 3. Address routes (KK-02: kepemilikan alamat di dalam query)
       else if (path === '/api/addresses' && method === 'GET') {
         response = await handleListAddresses(req);
       } else if (path === '/api/addresses' && method === 'POST') {
@@ -85,7 +85,7 @@ const server = Bun.serve({
       }
 
       // 8. Legacy PHP API Proxy Routes
-      // Orders proxy (IDOR, Stored XSS, Business Logic Cancel)
+      // Orders proxy (KK-03/05/09: kepemilikan & status ditegakkan di orders.php)
       else if (path === '/api/orders' && method === 'GET') {
         response = await proxyToPhp(req, 'orders.php', 'list');
       } else if (path.startsWith('/api/orders/') && path.endsWith('/notes') && method === 'GET') {
@@ -101,7 +101,7 @@ const server = Bun.serve({
         response = await proxyToPhp(req, 'orders.php', 'detail', { id: orderId });
       }
 
-      // Shipments & Invoices proxy (IDOR Invoice)
+      // Shipments & Invoices proxy (KK-04/10)
       else if (path === '/api/shipments' && method === 'GET') {
         response = await proxyToPhp(req, 'shipments.php', 'list');
       } else if (path === '/api/shipments' && method === 'POST') {
@@ -111,12 +111,12 @@ const server = Bun.serve({
         response = await proxyToPhp(req, 'shipments.php', 'invoice', { order_id: orderId, id: orderId });
       }
 
-      // Shipping Label Generator preview (RCE)
+      // Shipping Label Generator preview (KK-08: tanpa shell)
       else if (path === '/api/labels/preview') {
         response = await proxyToPhp(req, 'label_generator.php');
       }
 
-      // Coupons proxy (Business logic reusable coupon)
+      // Coupons proxy (KK-12: batas pemakaian ditegakkan)
       else if (path === '/api/coupons' && method === 'GET') {
         response = await proxyToPhp(req, 'coupons.php', 'list');
       } else if (path === '/api/coupons/verify' && method === 'POST') {
@@ -136,9 +136,11 @@ const server = Bun.serve({
         headers,
       });
     } catch (err: any) {
+      // KK-16: detail galat (SQL, stack, parser) hanya ke log server.
+      console.error(`[bff] ${method} ${path} gagal:`, err);
       const headers = new Headers();
       setCorsHeaders(headers);
-      return Response.json({ success: false, error: err.message }, { status: 500, headers });
+      return Response.json({ success: false, error: 'Terjadi kesalahan pada server' }, { status: 500, headers });
     }
   },
 });
@@ -146,68 +148,126 @@ const server = Bun.serve({
 console.log(`[KiosKita BFF] Bun API Gateway berjalan di http://localhost:${PORT}`);
 
 // Helper: Checkout
+// Prinsip: klien hanya boleh mengirim PILIHAN (produk, jumlah, alamat, kode kupon).
+// Semua ANGKA uang dan stok dihitung/diperiksa ulang di server, di dalam satu transaksi.
+const ONGKIR_FLAT = 15000; // KK-11: tarif tetap server (UI pun selalu 15.000); shipping_cost klien diabaikan
+const MAKS_QTY_PER_ITEM = 100;
+const MAKS_BARIS_KERANJANG = 50;
+
+/** Galat yang pesannya aman ditampilkan ke pengguna (400). Selainnya = 500 generik. */
+class KesalahanBisnis extends Error {}
+
 async function handleCheckout(req: Request): Promise<Response> {
   const user = extractAuthUser(req);
   if (!user) {
     return Response.json({ success: false, error: 'Akses ditolak: Harap login terlebih dahulu' }, { status: 401 });
   }
+  // Keranjang hanya untuk pelanggan (sejalan dengan meta route /cart di web).
+  if (user.role !== 'customer') {
+    return Response.json({ success: false, error: 'Checkout hanya untuk akun pelanggan' }, { status: 403 });
+  }
 
-  const body = await req.json();
-  const { items, shipping_address_id, coupon_code, shipping_cost = 15000 } = body;
+  let body: any;
+  try {
+    body = await req.json();
+  } catch {
+    return Response.json({ success: false, error: 'Format permintaan tidak valid' }, { status: 400 });
+  }
+  const { items, shipping_address_id, coupon_code } = body ?? {};
 
-  if (!items || !Array.isArray(items) || items.length === 0) {
+  if (!Array.isArray(items) || items.length === 0) {
     return Response.json({ success: false, error: 'Keranjang belanja kosong' }, { status: 400 });
+  }
+  if (items.length > MAKS_BARIS_KERANJANG) {
+    return Response.json({ success: false, error: 'Terlalu banyak baris dalam keranjang' }, { status: 400 });
+  }
+
+  // KK-11: kuantitas wajib bilangan bulat positif dengan batas atas (tolak negatif, nol, pecahan, NaN).
+  const baris: { product_id: number; quantity: number }[] = [];
+  const kebutuhan = new Map<number, number>();
+  for (const item of items) {
+    const pid = Number(item?.product_id);
+    const qty = Number(item?.quantity);
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(qty) || qty < 1 || qty > MAKS_QTY_PER_ITEM) {
+      return Response.json({ success: false, error: 'Produk atau kuantitas tidak valid' }, { status: 400 });
+    }
+    baris.push({ product_id: pid, quantity: qty });
+    kebutuhan.set(pid, (kebutuhan.get(pid) ?? 0) + qty);
+  }
+
+  // KK-11: alamat pengiriman (bila dipilih) wajib milik pemesan.
+  let alamatId: number | null = null;
+  if (shipping_address_id !== undefined && shipping_address_id !== null && shipping_address_id !== '') {
+    alamatId = Number(shipping_address_id);
+    if (!Number.isInteger(alamatId)) {
+      return Response.json({ success: false, error: 'Alamat pengiriman tidak valid' }, { status: 400 });
+    }
+    const [aRows] = await pool.query<any[]>('SELECT id FROM addresses WHERE id = ? AND user_id = ?', [alamatId, user.id]);
+    if (aRows.length === 0) {
+      return Response.json({ success: false, error: 'Alamat pengiriman tidak valid' }, { status: 400 });
+    }
   }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
+    // KK-13: kunci baris produk (urut id -> bebas deadlock) agar cek stok & pengurangan atomik.
+    const ids = [...kebutuhan.keys()].sort((a, b) => a - b);
+    const [pRows] = await conn.query<any[]>(
+      'SELECT id, name, price, stock FROM products WHERE id IN (?) ORDER BY id FOR UPDATE',
+      [ids]
+    );
+    const produk = new Map<number, any>(pRows.map((p: any) => [Number(p.id), p]));
+
+    for (const [pid, butuh] of kebutuhan) {
+      const p = produk.get(pid);
+      if (!p) throw new KesalahanBisnis(`Produk dengan ID ${pid} tidak ditemukan`);
+      if (Number(p.stock) < butuh) throw new KesalahanBisnis(`Stok "${p.name}" tidak mencukupi (tersisa ${p.stock})`);
+    }
+
     let subtotal = 0;
-    const validatedItems: any[] = [];
+    const validatedItems = baris.map((b) => {
+      const price = parseFloat(produk.get(b.product_id).price);
+      subtotal += price * b.quantity;
+      return { product_id: b.product_id, quantity: b.quantity, unit_price: price, total_price: price * b.quantity };
+    });
 
-    for (const item of items) {
-      const [pRows] = await conn.query<any[]>('SELECT * FROM products WHERE id = ?', [item.product_id]);
-      if (pRows.length === 0) {
-        throw new Error(`Produk dengan ID ${item.product_id} tidak ditemukan`);
-      }
-      const product = pRows[0];
-      const qty = parseInt(item.quantity, 10);
-      const price = parseFloat(product.price);
-      subtotal += price * qty;
-      validatedItems.push({
-        product_id: product.id,
-        quantity: qty,
-        unit_price: price,
-        total_price: price * qty,
-      });
-    }
-
+    // KK-12: kupon divalidasi penuh di server — aktif, minimum pembelian, dan batas pemakaian per pengguna.
     let discount = 0;
+    let kupon: any = null;
     if (coupon_code) {
-      const [cRows] = await conn.query<any[]>('SELECT * FROM coupons WHERE code = ? AND is_active = 1', [coupon_code]);
-      if (cRows.length > 0) {
-        const coupon = cRows[0];
-        if (coupon.discount_type === 'percentage') {
-          discount = (subtotal * parseFloat(coupon.discount_value)) / 100;
-        } else {
-          discount = parseFloat(coupon.discount_value);
-        }
-        discount = Math.min(discount, subtotal);
+      const kode = String(coupon_code).trim().toUpperCase();
+      // FOR UPDATE: dua checkout bersamaan dengan kupon yang sama diproses bergiliran.
+      const [cRows] = await conn.query<any[]>('SELECT * FROM coupons WHERE code = ? AND is_active = 1 FOR UPDATE', [kode]);
+      if (cRows.length === 0) throw new KesalahanBisnis('Kupon tidak valid atau sudah kedaluwarsa');
+      kupon = cRows[0];
 
-        // Catat penggunaan kupon
-        // Note: Meskipun dicatat, validasi di coupons.php sengaja mengabaikan riwayat ini (Business Logic flaw)
+      if (subtotal < parseFloat(kupon.min_purchase)) {
+        throw new KesalahanBisnis(`Minimum pembelian untuk kupon ini adalah Rp ${Number(kupon.min_purchase).toLocaleString('id-ID')}`);
       }
+      const [uRows] = await conn.query<any[]>(
+        'SELECT COUNT(*) AS n FROM coupon_usages WHERE coupon_id = ? AND user_id = ? FOR UPDATE',
+        [kupon.id, user.id]
+      );
+      if (Number(uRows[0].n) >= Number(kupon.max_uses_per_user)) {
+        throw new KesalahanBisnis('Kupon sudah mencapai batas pemakaian untuk akun Anda');
+      }
+
+      discount = kupon.discount_type === 'percentage'
+        ? (subtotal * parseFloat(kupon.discount_value)) / 100
+        : parseFloat(kupon.discount_value);
+      discount = Math.min(discount, subtotal);
     }
 
-    const grandTotal = Math.max(0, subtotal - discount + parseFloat(shipping_cost));
+    const grandTotal = subtotal - discount + ONGKIR_FLAT;
     const [countRows] = await conn.query<any[]>('SELECT COUNT(*) as total FROM orders');
     const nextOrderNum = `ORD-2026-${String(countRows[0].total + 1).padStart(4, '0')}`;
 
     const [orderRes] = await conn.query<any>(
       `INSERT INTO orders (order_number, tenant_id, customer_id, status, subtotal, discount, shipping_cost, grand_total, coupon_code, shipping_address_id)
        VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
-      [nextOrderNum, user.tenant_id, user.id, subtotal, discount, shipping_cost, grandTotal, coupon_code || null, shipping_address_id || null]
+      [nextOrderNum, user.tenant_id, user.id, subtotal, discount, ONGKIR_FLAT, grandTotal, kupon ? kupon.code : null, alamatId]
     );
 
     const orderId = orderRes.insertId;
@@ -218,9 +278,17 @@ async function handleCheckout(req: Request): Promise<Response> {
          VALUES (?, ?, ?, ?, ?)`,
         [orderId, vItem.product_id, vItem.quantity, vItem.unit_price, vItem.total_price]
       );
+    }
 
-      // Kurangi stok
-      await conn.query(`UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?`, [vItem.quantity, vItem.product_id]);
+    // KK-13: pengurangan bersyarat — tidak pernah menembus nol, tidak pernah "GREATEST(0, ...)" diam-diam.
+    for (const [pid, butuh] of kebutuhan) {
+      const [u] = await conn.query<any>('UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?', [butuh, pid, butuh]);
+      if (u.affectedRows !== 1) throw new KesalahanBisnis('Stok berubah saat diproses, silakan coba lagi');
+    }
+
+    // KK-12: pemakaian kupon DICATAT, sehingga batas max_uses_per_user benar-benar berlaku.
+    if (kupon) {
+      await conn.query('INSERT INTO coupon_usages (coupon_id, user_id, order_id) VALUES (?, ?, ?)', [kupon.id, user.id, orderId]);
     }
 
     await conn.commit();
@@ -236,7 +304,11 @@ async function handleCheckout(req: Request): Promise<Response> {
     });
   } catch (err: any) {
     await conn.rollback();
-    return Response.json({ success: false, error: err.message }, { status: 400 });
+    if (err instanceof KesalahanBisnis) {
+      return Response.json({ success: false, error: err.message }, { status: 400 });
+    }
+    console.error('[checkout] gagal:', err);
+    return Response.json({ success: false, error: 'Pesanan gagal diproses' }, { status: 500 });
   } finally {
     conn.release();
   }
@@ -272,13 +344,15 @@ async function handleDashboardStats(req: Request): Promise<Response> {
     user.role === 'admin' ? [] : [user.tenant_id]
   );
 
+  // KK-14: cakupan pesanan terbaru sama dengan cakupan angka di atasnya —
+  // customer: miliknya; admin: semua; manager/staff: hanya tenant-nya (dulu: semua tenant).
   const [recentOrders] = await pool.query<any[]>(
     `SELECT o.id, o.order_number, o.status, o.grand_total, o.created_at, u.name as customer_name
      FROM orders o
      JOIN users u ON o.customer_id = u.id
-     ${user.role === 'customer' ? 'WHERE o.customer_id = ?' : ''}
+     ${user.role === 'customer' ? 'WHERE o.customer_id = ?' : user.role === 'admin' ? '' : 'WHERE o.tenant_id = ?'}
      ORDER BY o.id DESC LIMIT 5`,
-    user.role === 'customer' ? [user.id] : []
+    user.role === 'customer' ? [user.id] : user.role === 'admin' ? [] : [user.tenant_id]
   );
 
   return Response.json({
@@ -315,11 +389,20 @@ async function handleCreateAdminUser(req: Request): Promise<Response> {
     return Response.json({ success: false, error: 'Hanya administrator yang diizinkan menambah user' }, { status: 403 });
   }
 
-  const body = await req.json();
-  const { name, email, password, role = 'staff', tenant_id = 1, phone = '' } = body;
+  let body: any;
+  try {
+    body = await req.json();
+  } catch {
+    return Response.json({ success: false, error: 'Format permintaan tidak valid' }, { status: 400 });
+  }
+  const { name, email, password, role = 'staff', tenant_id = 1, phone = '' } = body ?? {};
 
   if (!name || !email || !password) {
     return Response.json({ success: false, error: 'Nama, email, dan password wajib diisi' }, { status: 400 });
+  }
+  // Nilai peran & tenant divalidasi sebelum menyentuh DB (dulu galat ENUM/FK mentah bocor ke klien).
+  if (!['admin', 'manager', 'staff', 'customer'].includes(role) || !Number.isInteger(Number(tenant_id))) {
+    return Response.json({ success: false, error: 'Peran atau tenant tidak valid' }, { status: 400 });
   }
 
   const hashedPassword = await Bun.password.hash(password);

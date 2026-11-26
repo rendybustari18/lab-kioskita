@@ -1,0 +1,12 @@
+{
+ "KK-06": {
+  "dieksekusi": false,
+  "panjang_token_terbaca": null,
+  "teks_tampil": "<img src=x onerror=\"window.__xss=(localStorage.getItem('kioskita_token')||'').length;document.body.setAttribute('data-xss','1')\">Barang aman, siap kirim"
+ },
+ "KK-07": {
+  "dieksekusi": false,
+  "panjang_token_terbaca": null,
+  "teks_tampil": "Hasil pencarian pesanan untuk kata kunci: <img src=x onerror=\"window.__xss=(localStorage.getItem('kioskita_token')||'').length;document.body.setAttribute('data-xss','1')\">"
+ }
+}

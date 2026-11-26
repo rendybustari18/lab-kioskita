@@ -23,27 +23,40 @@ export async function handleGetProfile(req: Request): Promise<Response> {
   return Response.json({ success: true, profile: rows[0] });
 }
 
-// Celah Privilege Escalation:
-// Handler update profil mempercayai field 'role' dari payload client tanpa validasi izin admin.
-// Pengguna dengan role 'customer' atau 'staff' dapat mengirimkan field 'role': 'admin' atau 'manager'.
+// KK-01: update profil hanya menulis field yang ada di allowlist (name, phone).
+// Field lain dari payload — role, tenant_id, email — diabaikan secara desain, bukan divalidasi:
+// peran hanya boleh diubah administrator lewat endpoint administratif.
 export async function handleUpdateProfile(req: Request): Promise<Response> {
   const currentUser = extractAuthUser(req);
   if (!currentUser) {
     return Response.json({ success: false, error: 'Akses ditolak: belum terautentikasi' }, { status: 401 });
   }
 
+  let body: any;
   try {
-    const body = await req.json();
-    const { name, phone, role } = body;
+    body = await req.json();
+  } catch {
+    return Response.json({ success: false, error: 'Format permintaan tidak valid' }, { status: 400 });
+  }
 
-    // Mass assignment / role trusting flaw: role langsung diperbarui ke database
+  // String kosong = "tidak diubah" (perilaku lama dipertahankan lewat COALESCE).
+  const name = typeof body?.name === 'string' && body.name.trim() !== '' ? body.name.trim() : null;
+  const phone = typeof body?.phone === 'string' && body.phone.trim() !== '' ? body.phone.trim() : null;
+
+  if (name !== null && name.length > 150) {
+    return Response.json({ success: false, error: 'Nama maksimal 150 karakter' }, { status: 400 });
+  }
+  if (phone !== null && !/^[0-9+\-\s]{6,30}$/.test(phone)) {
+    return Response.json({ success: false, error: 'Format nomor telepon tidak valid' }, { status: 400 });
+  }
+
+  try {
     await pool.query(
-      `UPDATE users 
-       SET name = COALESCE(?, name), 
-           phone = COALESCE(?, phone), 
-           role = COALESCE(?, role) 
+      `UPDATE users
+       SET name = COALESCE(?, name),
+           phone = COALESCE(?, phone)
        WHERE id = ?`,
-      [name || null, phone || null, role || null, currentUser.id]
+      [name, phone, currentUser.id]
     );
 
     // Ambil data terbaru setelah pembaruan
@@ -65,7 +78,7 @@ export async function handleUpdateProfile(req: Request): Promise<Response> {
       token: newToken,
     });
   } catch (error: any) {
-    return Response.json({ success: false, error: error.message }, { status: 500 });
+    console.error('[profile] update gagal:', error);
+    return Response.json({ success: false, error: 'Terjadi kesalahan pada server' }, { status: 500 });
   }
 }
-

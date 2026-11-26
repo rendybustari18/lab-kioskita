@@ -113,7 +113,7 @@
         </p>
       </div>
 
-      <!-- Catatan Internal Gudang (Sink Stored XSS) -->
+      <!-- Catatan Pesanan (KK-05/06: dirender sebagai teks; pelanggan hanya melihat catatan 'customer') -->
       <div class="card">
         <div class="card-header">
           <h3 class="section-title">Catatan Internal Gudang &amp; Operasional</h3>
@@ -125,8 +125,9 @@
               <span><b>{{ n.author_name }}</b> ({{ n.author_role }})</span>
               <span>{{ n.created_at }}</span>
             </div>
-            <!-- Celah Stored XSS: Konten catatan dirender mentah dengan v-html -->
-            <div class="note-content" v-html="n.content"></div>
+            <!-- KK-06: konten catatan adalah data pengguna -> dirender sebagai TEKS ({{ }} di-escape Vue).
+                 pre-wrap menjaga baris baru yang dulu bergantung pada HTML mentah. -->
+            <div class="note-content" style="white-space: pre-wrap;">{{ n.content }}</div>
           </div>
         </div>
         <div v-else class="text-soft" style="font-size: 13px; margin-bottom: 14px;">
@@ -149,7 +150,7 @@
       </div>
     </div>
 
-    <!-- Modal Preview Label Pengiriman (RCE Sink) -->
+    <!-- Modal Preview Label Pengiriman (KK-08: format & kurir divalidasi server, tanpa shell) -->
     <div v-if="showLabelModal" class="modal-overlay">
       <div class="modal">
         <div class="modal-header">

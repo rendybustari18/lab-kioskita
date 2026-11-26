@@ -11,6 +11,15 @@ export async function proxyToPhp(
   const url = new URL(req.url);
   const user = extractAuthUser(req);
 
+  // KK-15: seluruh endpoint legacy membutuhkan login. Request anonim berhenti di gerbang,
+  // tidak diteruskan ke PHP tanpa identitas (dulu PHP lalu menebak peran "customer").
+  if (!user) {
+    return Response.json(
+      { success: false, error: 'Akses ditolak: Harap login terlebih dahulu' },
+      { status: 401 }
+    );
+  }
+
   // Teruskan query params
   const targetUrl = new URL(`${PHP_API_BASE}/${targetScript}`);
   url.searchParams.forEach((val, key) => {
@@ -27,14 +36,12 @@ export async function proxyToPhp(
     }
   }
 
+  // Header dibangun baru: header X-User-* kiriman klien tidak pernah ikut diteruskan.
   const headers = new Headers();
   headers.set('Content-Type', req.headers.get('Content-Type') || 'application/json');
-
-  if (user) {
-    headers.set('X-User-Id', String(user.id));
-    headers.set('X-User-Role', user.role);
-    headers.set('X-Tenant-Id', String(user.tenant_id));
-  }
+  headers.set('X-User-Id', String(user.id));
+  headers.set('X-User-Role', user.role);
+  headers.set('X-Tenant-Id', String(user.tenant_id));
 
   const method = req.method;
   let body: any = undefined;
@@ -65,9 +72,11 @@ export async function proxyToPhp(
       },
     });
   } catch (error: any) {
+    // KK-16: alamat & galat jaringan internal hanya ke log.
+    console.error('[proxy] gagal menghubungi PHP legacy:', error);
     return Response.json({
       success: false,
-      error: `Gagal meneruskan request ke PHP legacy API: ${error.message}`,
+      error: 'Layanan sedang tidak tersedia',
     }, { status: 502 });
   }
 }

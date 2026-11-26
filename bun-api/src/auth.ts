@@ -1,7 +1,14 @@
 import jwt from 'jsonwebtoken';
 import pool from './db';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'kioskita-super-secret-jwt-key-2026';
+// KK-16: tidak ada secret cadangan di kode. Nilai lama ikut ter-commit di repo, sehingga siapa pun
+// bisa menandatangani token sah. Tanpa JWT_SECRET yang memadai, layanan menolak start (fail closed).
+const JWT_SECRET = process.env.JWT_SECRET ?? '';
+if (JWT_SECRET.length < 32) {
+  throw new Error('JWT_SECRET wajib di-set lewat environment (minimal 32 karakter)');
+}
+
+const PERAN_SAH = ['admin', 'manager', 'staff', 'customer'] as const;
 
 export interface UserPayload {
   id: number;
@@ -25,13 +32,19 @@ export function generateToken(user: UserPayload): string {
       tenant_name: user.tenant_name,
     },
     JWT_SECRET,
-    { expiresIn: '24h' }
+    { expiresIn: '24h', algorithm: 'HS256' }
   );
 }
 
 export function verifyToken(token: string): UserPayload | null {
   try {
-    return jwt.verify(token, JWT_SECRET) as UserPayload;
+    // Algoritma dipin: token dengan alg lain ditolak walau tanda tangannya "cocok".
+    const p = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as UserPayload;
+    // Bentuk klaim divalidasi sebelum dipakai sebagai identitas (diteruskan ke PHP lewat X-User-*).
+    if (!Number.isInteger(p?.id) || !Number.isInteger(p?.tenant_id) || !PERAN_SAH.includes(p?.role as any)) {
+      return null;
+    }
+    return p;
   } catch {
     return null;
   }
@@ -47,18 +60,25 @@ export function extractAuthUser(req: Request): UserPayload | null {
 }
 
 export async function handleLogin(req: Request): Promise<Response> {
+  let body: any;
   try {
-    const body = await req.json();
-    const { email, password } = body;
+    body = await req.json();
+  } catch {
+    // KK-16: galat parser tidak diteruskan ke klien.
+    return Response.json({ success: false, error: 'Format permintaan tidak valid' }, { status: 400 });
+  }
 
-    if (!email || !password) {
+  try {
+    const { email, password } = body ?? {};
+
+    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
       return Response.json({ success: false, error: 'Email dan password wajib diisi' }, { status: 400 });
     }
 
     const [rows] = await pool.query<any[]>(
-      `SELECT u.*, t.name as tenant_name 
-       FROM users u 
-       JOIN tenants t ON u.tenant_id = t.id 
+      `SELECT u.*, t.name as tenant_name
+       FROM users u
+       JOIN tenants t ON u.tenant_id = t.id
        WHERE u.email = ?`,
       [email]
     );
@@ -93,7 +113,8 @@ export async function handleLogin(req: Request): Promise<Response> {
       user: payload,
     });
   } catch (error: any) {
-    return Response.json({ success: false, error: error.message }, { status: 500 });
+    console.error('[auth] login gagal:', error);
+    return Response.json({ success: false, error: 'Terjadi kesalahan pada server' }, { status: 500 });
   }
 }
 
@@ -117,4 +138,3 @@ export async function handleGetMe(req: Request): Promise<Response> {
 
   return Response.json({ success: true, user: rows[0] });
 }
-

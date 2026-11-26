@@ -1,0 +1,75 @@
+# Bukti harness-keamanan.ts — kode SESUDAH paket-kioskita-aman-r1
+# Dijalankan: 2026-11-26 00:24 WIB · stack lokal tanpa Docker (MySQL 8.0.46, PHP 8.3.6, Bun 1.4.4)
+# Database di-reset dari database/01_schema.sql + 02_seed.sql sebelum run.
+
+
+KiosKita · harness keamanan · http://127.0.0.1:3001 · repo=.
+
+── [R] ALUR SAH ─────────────────────────────────────────────
+  ✔ LULUS  R-01  Semua akun dummy bisa login dan /auth/me sesuai
+            8 akun login, /auth/me = budi
+  ✔ LULUS  R-02  Katalog produk dapat dibaca
+            12 produk
+  ✔ LULUS  R-03  Pelanggan melihat pesanan, detail, faktur, dan catatan miliknya sendiri
+            daftar [1,2], detail/faktur/catatan pesanan 1 = 200
+  ✔ LULUS  R-04  Staf membaca pesanan tenant-nya dan menulis + membaca catatan internal
+            staff1: detail 200, catatan internal tersimpan & terbaca
+  ✔ LULUS  R-05  Admin membaca pesanan lintas tenant dan mengelola user
+            admin: detail tenant 2 = 200, list & buat user OK
+  ✔ LULUS  R-06  Checkout sah: harga, ongkir, kupon, dan stok dihitung benar
+            grand_total 295.000, stok produk 1: 45 -> 43
+  ✔ LULUS  R-07  Pelanggan membatalkan pesanan pending miliknya, stok kembali
+            pesanan #10 dibatalkan, stok produk 4: 79 -> 80
+  ✔ LULUS  R-08  Profil & alamat milik sendiri dapat diubah; alamat baru dapat ditambah
+            profil, alamat 1, alamat baru = OK
+  ✔ LULUS  R-09  Preview label pesanan milik sendiri tetap menghasilkan teks yang sama
+            [LABEL PREVIEW] Order: ORD-2026-0001 Kurir: JNE Reguler Format: standard
+  ✔ LULUS  R-10  Staf membuat resi untuk pesanan tenant-nya yang siap kirim
+            resi TRK-20261125-1207EE, pesanan #11 -> shipped
+  ✔ LULUS  R-11  Kupon valid untuk pengguna yang belum memakainya
+            siti: HEMAT10 atas 200.000 -> diskon 20.000
+  ✔ LULUS  R-12  Dashboard menampilkan angka sesuai cakupan peran
+            budi: hanya miliknya; admin: semua
+
+── [S] SERANGAN ─────────────────────────────────────────────
+  ✔ AMAN   KK-01  Eskalasi peran lewat PUT /api/profile {"role":"admin"}
+            PUT 200; peran dewi sesudahnya = customer
+  ✔ AMAN   KK-02  BOLA alamat: baca & ubah alamat pelanggan lain
+            GET /addresses/4 -> 404; PUT /addresses/5 -> 404, tersimpan=false
+  ✔ AMAN   KK-03  IDOR detail pesanan (tanpa login, lintas pelanggan, lintas tenant)
+            tanpa login 401; budi->#5 404; staff2->#1 404
+  ✔ AMAN   KK-04  IDOR faktur: faktur pelanggan lain beserta alamat & telepon
+            tanpa login 401; budi->faktur #7 404
+  ✔ AMAN   KK-05  Catatan pesanan: baca/tulis lintas pesanan, penyamaran admin, catatan internal bocor
+            budi baca catatan #5: false; tulis tanpa login: false (401); budi lihat catatan internal: false; budi tulis 'internal': false
+  ✔ AMAN   KK-06  Stored XSS: konten catatan dirender v-html (OrderDetail.vue)
+            konten catatan dirender sebagai teks ({{ }})
+  ✔ AMAN   KK-07  DOM XSS: kata kunci pencarian dirender v-html (Orders.vue)
+            kata kunci dirender sebagai teks
+  ✔ AMAN   KK-08  Command injection pada preview label -> eksekusi perintah di server
+            tanpa login 401, preview=null; budi 400; fungsi shell di php-api/src: false
+  ✔ AMAN   KK-09  Pembatalan: pesanan orang lain, pesanan terkirim, dan pembatalan berulang menggelembungkan stok
+            joko batalkan milik budi: false (404); batalkan 'delivered': false (409); stok produk 3 60 -> 60
+  ✔ AMAN   KK-10  Pelanggan membuat resi (menandai "shipped") untuk pesanan orang lain
+            POST /shipments oleh joko -> 403; status pesanan budi = pending
+  ✔ AMAN   KK-11  Checkout: ongkir negatif, kuantitas negatif, alamat milik orang lain
+            ongkir -310.000 -> grand_total 325000; qty -5 -> 400, stok 100->100; alamat joko -> 400, alamat joko bocor=false
+  ✔ AMAN   KK-12  Kupon: dipakai ulang melebihi batas dan di bawah minimum pembelian
+            verify ulang HEMAT10 (budi): false; DISKON50K di bawah minimum: false; HEMAT10 ke-2 (dewi): total 400 (pertama 213000)
+  ✔ AMAN   KK-13  Overselling: memesan melebihi stok
+            stok produk 9 = 15, pesan 65 -> 400 ditolak
+  ✔ AMAN   KK-14  Dashboard: staf tenant 2 melihat pesanan terbaru tenant 1
+            recent_orders staff2: 0 pesanan milik pelanggan tenant 1
+  ✔ AMAN   KK-15  Gerbang meneruskan request tanpa token; layanan PHP fail-open
+            semua titik PHP menolak tanpa token (401)
+  ✔ AMAN   KK-16  Kebocoran informasi: pesan galat mentah & secret JWT cadangan di kode
+            JSON rusak -> 400 "Format permintaan tidak valid"; secret cadangan di auth.ts: false
+
+── [K] KETAHANAN KONKURENSI ─────────────────────────────────
+  ✔ TAHAN  K-01  10 checkout BERSAMAAN memperebutkan stok terbatas: tidak ada overselling
+            stok awal 24; 10 x 5 unit paralel -> diterima 4 (20 unit); stok akhir 4; alasan tolak: "Stok "Tempat Sampah Sensor Pintar 12L" tidak mencukupi (tersisa 4)" x6
+  ✔ TAHAN  K-02  Kupon sekali-pakai dipakai 5 checkout BERSAMAAN: diskon tepat sekali
+            GRATISONGKIR (maks 1x/pengguna), 5 checkout paralel -> 1 pesanan mendapat diskon; alasan tolak: "Kupon sudah mencapai batas pemakaian untuk akun Anda" x4
+
+RINGKASAN: regresi 12/12 LULUS · serangan 16/16 AMAN · konkurensi 2/2 TAHAN
+✔ PASS
